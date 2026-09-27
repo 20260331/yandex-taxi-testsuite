@@ -16,3 +16,13 @@ if _pytest_asyncio_legacy():
     from .plugin_legacy import *
 else:
     from .plugin import *
+
+
+def pytest_capability_register(register_capability):
+    register_capability(
+        name='asyncio',
+        provider='testsuite.plugins.asyncio',
+        version='1.0',
+        fixture_scope='session',
+        teardown='required',
+    )

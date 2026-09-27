@@ -37,6 +37,17 @@ def pytest_configure(config):
     )
 
 
+def pytest_capability_register(register_capability):
+    register_capability(
+        name='redis',
+        provider='testsuite.databases.redis',
+        version='1.0',
+        requires=[('environment', '>=1.0')],
+        fixture_scope='session',
+        teardown='best-effort',
+    )
+
+
 def pytest_service_register(register_service):
     register_service('redis', service.create_redis_service)
     register_service('redis-cluster', service.create_cluster_redis_service)

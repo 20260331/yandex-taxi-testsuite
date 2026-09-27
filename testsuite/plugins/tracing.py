@@ -5,6 +5,16 @@ import pytest
 from testsuite.tracing import TraceidManager
 
 
+def pytest_capability_register(register_capability):
+    register_capability(
+        name='tracing',
+        provider='testsuite.plugins.tracing',
+        version='1.0',
+        fixture_scope='function',
+        teardown='none',
+    )
+
+
 @pytest.fixture(scope='session')
 def testsuite_traceid_generator():
     """

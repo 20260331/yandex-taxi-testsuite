@@ -23,6 +23,17 @@ def pytest_configure(config):
     )
 
 
+def pytest_capability_register(register_capability):
+    register_capability(
+        name='kafka',
+        provider='testsuite.databases.kafka',
+        version='1.0',
+        requires=[('environment', '>=1.0')],
+        fixture_scope='session',
+        teardown='best-effort',
+    )
+
+
 def pytest_service_register(register_service):
     register_service('kafka', service.create_kafka_service)
 

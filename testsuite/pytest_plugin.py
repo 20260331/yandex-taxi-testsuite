@@ -2,6 +2,7 @@ import testsuite
 
 # Common testsuite plugins
 pytest_plugins = [
+    'testsuite.plugins.capabilities',
     'testsuite.plugins.asyncio',
     'testsuite.daemons.pytest_plugin',
     'testsuite.environment.pytest_plugin',

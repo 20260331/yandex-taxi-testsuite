@@ -450,6 +450,17 @@ def wait_service_started(pytestconfig, service_client_session_factory):
     return waiter
 
 
+def pytest_capability_register(register_capability):
+    register_capability(
+        name='daemons',
+        provider='testsuite.daemons',
+        version='1.0',
+        requires=[('asyncio', '>=1.0')],
+        fixture_scope='session',
+        teardown='required',
+    )
+
+
 def pytest_addoption(parser):
     group = parser.getgroup('services')
     group.addoption(

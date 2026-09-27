@@ -26,6 +26,17 @@ Random port is used by default. If testsuite is started with
 logger = logging.getLogger(__name__)
 
 
+def pytest_capability_register(register_capability):
+    register_capability(
+        name='mockserver',
+        provider='testsuite.mockserver',
+        version='1.0',
+        requires=[('asyncio', '>=1.0')],
+        fixture_scope='session',
+        teardown='best-effort',
+    )
+
+
 def pytest_addoption(parser):
     group = parser.getgroup('mockserver')
     group.addoption(

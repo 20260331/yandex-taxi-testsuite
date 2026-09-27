@@ -22,6 +22,17 @@ def pytest_configure(config):
     config.addinivalue_line('markers', 'mysql: per-test MySQL initialization')
 
 
+def pytest_capability_register(register_capability):
+    register_capability(
+        name='mysql',
+        provider='testsuite.databases.mysql',
+        version='1.0',
+        requires=[('environment', '>=1.0')],
+        fixture_scope='session',
+        teardown='best-effort',
+    )
+
+
 def pytest_service_register(register_service):
     register_service('mysql', service.create_service)
 

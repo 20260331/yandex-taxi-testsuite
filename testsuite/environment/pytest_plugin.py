@@ -73,6 +73,16 @@ class TestsuiteEnvironmentPlugin:
         return headers
 
 
+def pytest_capability_register(register_capability):
+    register_capability(
+        name='environment',
+        provider='testsuite.environment',
+        version='1.0',
+        fixture_scope='session',
+        teardown='required',
+    )
+
+
 def pytest_addoption(parser):
     group = parser.getgroup('env', 'Testsuite environment')
     group.addoption(

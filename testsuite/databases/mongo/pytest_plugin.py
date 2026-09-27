@@ -159,6 +159,17 @@ def pytest_report_header(config):
     return [f'Mongo: {conninfo.get_uri()}']
 
 
+def pytest_capability_register(register_capability):
+    register_capability(
+        name='mongo',
+        provider='testsuite.databases.mongo',
+        version='1.0',
+        requires=[('environment', '>=1.0')],
+        fixture_scope='session',
+        teardown='best-effort',
+    )
+
+
 def pytest_service_register(register_service):
     register_service('mongo', service.create_mongo_service)
 
