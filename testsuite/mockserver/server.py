@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import itertools
+import json
 import logging
 import pathlib
 import re
@@ -23,7 +24,7 @@ from testsuite.utils import (
 )
 from testsuite.utils import net as net_utils
 
-from . import classes, exceptions, magicargs
+from . import classes, exceptions, magicargs, scenarios
 from .exceptions import __tracebackhide__  # noqa: F401
 
 DEFAULT_TRACE_ID_HEADER = 'X-YaTraceId'
@@ -126,6 +127,9 @@ class Session:
         self.http_proxy_enabled = http_proxy_enabled
         self.mockserver_host = mockserver_host
         self._asyncexc_append = asyncexc_append
+        self.scenarios = scenarios.ScenarioEngine(
+            asyncexc_append=asyncexc_append,
+        )
 
     def get_handler(self, path: str) -> tuple[Handler, RouteParams]:
         handler = self.handlers.get(path)
@@ -168,6 +172,10 @@ class Session:
         request: MockserverRequest,
         nofail_404: bool,
     ):
+        claim = await self.scenarios.try_claim(request)
+        if claim is not None:
+            return await self._serve_scenario_request(request, claim)
+
         try:
             handler, kwargs = self._get_handler_for_request(request)
         except exceptions.HandlerNotFoundError as exc:
@@ -194,6 +202,71 @@ class Session:
         except Exception as exc:
             self._asyncexc_append(exc)
             return _internal_error(f'Internal server error: {exc!r}')
+
+    async def _serve_scenario_request(
+        self,
+        request: MockserverRequest,
+        claim: scenarios.Claim,
+    ):
+        step = claim.step
+        try:
+            body_raw = claim.body or await request.content.read()
+            context = scenarios.build_render_context(claim, body_raw, request)
+            response_spec = step.response
+            headers: dict[str, str] = {}
+            if response_spec.headers:
+                headers = {
+                    key: scenarios.render_string(value, context)
+                    for key, value in response_spec.headers.items()
+                }
+            if response_spec.json is not scenarios._MISSING:
+                rendered = scenarios.render_string(
+                    json.dumps(response_spec.json, ensure_ascii=False),
+                    context,
+                )
+                body = rendered.encode('utf-8')
+                content_type: str | None = (
+                    response_spec.content_type or 'application/json'
+                )
+            elif response_spec.text is not None:
+                body = scenarios.render_string(
+                    response_spec.text,
+                    context,
+                ).encode('utf-8')
+                content_type = response_spec.content_type or 'text/plain'
+            elif response_spec.body is not None:
+                body = response_spec.body
+                content_type = response_spec.content_type
+            else:
+                body = b''
+                content_type = response_spec.content_type
+
+            response = aiohttp.web.Response(
+                status=response_spec.status,
+                body=body,
+                headers=headers,
+                content_type=content_type,
+            )
+        except Exception as exc:
+            # Script error (e.g. bad template): undo the claim, report the
+            # error and keep the server operational.
+            await claim.rollback()
+            self._asyncexc_append(exc)
+            return _internal_error(f'Internal server error: {exc!r}')
+
+        if step.delay:
+            # Cancellable sleep; client disconnect cancels the request while
+            # the claim itself stays consumed.
+            await asyncio.sleep(step.delay)
+
+        if step.close_connection == 'abort':
+            # Drop the transport without sending anything. The response below
+            # is prepared against a closed transport and writes nothing.
+            request.protocol.force_close()
+            return response
+        if step.close_connection == 'close':
+            response.force_close()
+        return response
 
     def register_handler(
         self,
@@ -374,6 +447,43 @@ class Server:
         )
 
 
+class ScenariosFixture:
+    """Per-test stateful scenario loader.
+
+    Accessible as ``mockserver.scenarios``. Scenarios are validated on load
+    and removed automatically when the test finishes.
+    """
+
+    def __init__(self, session: 'Session') -> None:
+        self._session = session
+
+    def load(
+        self,
+        doc: dict | list,
+    ) -> typing.Union[scenarios.ScenarioHandle, list[scenarios.ScenarioHandle]]:
+        """Validate and load a scenario document or a list of documents.
+
+        :raises testsuite.mockserver.scenarios.ScenarioSpecError: on schema
+            violations.
+        """
+        if isinstance(doc, list):
+            return [self.load(item) for item in doc]  # type: ignore[list-item]
+        spec = scenarios.validate_scenario(
+            doc,
+            max_delay=self._session.scenarios.max_delay,
+        )
+        return self._session.scenarios.add(spec)
+
+    def load_file(
+        self,
+        path,
+    ) -> typing.Union[scenarios.ScenarioHandle, list[scenarios.ScenarioHandle]]:
+        """Load scenario(s) from a YAML or JSON file."""
+        from testsuite.utils import yaml_util
+
+        return self.load(yaml_util.load_file(path))
+
+
 class MockserverFixture:
     """Mockserver handler installer fixture."""
 
@@ -390,6 +500,7 @@ class MockserverFixture:
         self._base_prefix = base_prefix
         self._base_prefix_re = re.escape(base_prefix)
         self._strict_default = strict_default
+        self.scenarios = ScenariosFixture(session)
 
     def new(self, prefix: str) -> 'MockserverFixture':
         """Create mockserver installer with given base prefix."""
