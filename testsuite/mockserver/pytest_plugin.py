@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
 import logging
+import pathlib
+import re
 import warnings
 
 import pytest
@@ -10,6 +12,7 @@ from testsuite.tracing import TraceidManager
 from testsuite.utils import net
 
 from . import classes, exceptions, server
+from . import faults as faults_mod
 
 MOCKSERVER_DEFAULT_PORT = 9999
 MOCKSERVER_SSL_DEFAULT_PORT = 9998
@@ -71,6 +74,21 @@ def pytest_addoption(parser):
         action='store_true',
         help='Enable debugging logs.',
     )
+    group.addoption(
+        '--faults-replay',
+        type=str,
+        default=None,
+        help=(
+            'Replay fault decisions from an exported fault scheduler '
+            'decision log (json file).'
+        ),
+    )
+    group.addoption(
+        '--faults-log-dir',
+        type=str,
+        default=None,
+        help='Dump per-test fault scheduler decision logs to this directory.',
+    )
     parser.addini(
         'mockserver-tracing-enabled',
         type='bool',
@@ -121,6 +139,13 @@ def pytest_configure(config):
         'markers',
         'mockserver_assert_lost_calls: assert that all calls to mockservers are checked',
     )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    setattr(item, f'_faults_report_{call.when}', report)
 
 
 def pytest_register_object_hooks():
@@ -198,6 +223,68 @@ def mockserver(
     """
     with mockserver_create_session(_mockserver) as fixture:
         yield fixture
+
+
+@pytest.fixture
+async def faults(
+    request,
+    _mockserver: server.Server,
+    _mockserver_ssl: server.Server | None,
+    asyncexc_append,
+) -> types.AsyncYieldFixture[faults_mod.FaultScheduler]:
+    """Returns per-test seed-based fault scheduler.
+
+    Configure it with ``scheduler.configure(seed=..., rules=[...])``. The
+    scheduler is automatically attached to the http (and https) mockserver,
+    the event loop and thus the asyncio socket tools, and detached on
+    teardown. When the fixture is not requested no faults are injected.
+    """
+    replay_path = request.config.option.faults_replay
+    if replay_path:
+        scheduler = faults_mod.FaultScheduler.load_log(replay_path)
+    else:
+        scheduler = faults_mod.FaultScheduler()
+    loop = asyncio.get_running_loop()
+    scheduler.arm(loop)
+    # Replay mismatches happen in background server tasks; route them to
+    # asyncexc so they fail the test even if the client ignores them.
+    scheduler.set_mismatch_callback(asyncexc_append)
+    _mockserver.set_fault_scheduler(scheduler)
+    if _mockserver_ssl is not None:
+        _mockserver_ssl.set_fault_scheduler(scheduler)
+    try:
+        yield scheduler
+    finally:
+        _mockserver.set_fault_scheduler(None)
+        if _mockserver_ssl is not None:
+            _mockserver_ssl.set_fault_scheduler(None)
+        scheduler.disarm(loop)
+        scheduler.log_decisions()
+        scheduler.check_replay_exhausted()
+
+        log_dir = request.config.option.faults_log_dir
+        if log_dir:
+            target = pathlib.Path(log_dir) / _safe_log_name(request.node.nodeid)
+            scheduler.dump_log(target.with_suffix('.json'))
+
+        # Fixture finalization runs before the teardown report is built,
+        # so the decision log is attached to the 'teardown' report.
+        failed = False
+        for when in ('setup', 'call'):
+            report = getattr(request.node, f'_faults_report_{when}', None)
+            if report is not None and report.failed:
+                failed = True
+                break
+        if failed:
+            request.node.add_report_section(
+                'teardown',
+                'Faults',
+                scheduler.report_section(),
+            )
+
+
+def _safe_log_name(nodeid: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_.-]+', '_', nodeid).strip('_') or 'test'
 
 
 @pytest.fixture

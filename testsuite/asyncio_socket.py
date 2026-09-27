@@ -2,9 +2,13 @@
 
 
 import asyncio
+import contextlib
 import select
 import socket
+import struct
 import sys
+
+from testsuite.mockserver import faults
 
 DEFAULT_TIMEOUT = 10.0
 _DefaultTimeout = object()
@@ -18,12 +22,17 @@ class AsyncioSocket:
         sock: socket.socket,
         loop: asyncio.AbstractEventLoop | None = None,
         timeout=DEFAULT_TIMEOUT,
+        *,
+        fault_scheduler: faults.FaultScheduler | None = None,
     ):
         if loop is None:
             loop = asyncio.get_running_loop()
         self._loop: asyncio.AbstractEventLoop = loop
         self._sock: socket.socket = sock
         self._default_timeout = timeout
+        if fault_scheduler is None:
+            fault_scheduler = faults.scheduler_for_loop(self._loop)
+        self._fault_scheduler = fault_scheduler
         sock.setblocking(False)
 
     def __repr__(self):
@@ -61,11 +70,66 @@ class AsyncioSocket:
             return await self._sendto_legacy(*args, timeout=timeout)
 
     async def sendall(self, data, *, timeout=_DefaultTimeout):
+        decision = self._fault_evaluate(faults.SEND)
+        if decision is not None and decision.action is not None:
+            action = self._fault_scheduler.resolve_action(decision, len(data))
+            assert action is not None
+            fault_type = action['type']
+            if fault_type == faults.DELAY:
+                await asyncio.sleep(action['delay'])
+                # Fall through to the normal send.
+            elif fault_type == faults.SHORT_WRITE:
+                return await self._send_bytes(data[: action['bytes']])
+            elif fault_type == faults.HALF_PACKET:
+                await self._send_exact(data[: action['bytes']])
+                await asyncio.sleep(action.get('delay', 0))
+                return await self._with_timeout(
+                    self._loop.sock_sendall(
+                        self._sock, data[action['bytes'] :]
+                    ),
+                    timeout=timeout,
+                )
+            elif fault_type == faults.RESET:
+                self._fault_reset()
+                raise faults.FaultConnectionReset(
+                    'Connection reset by fault scheduler',
+                )
+            elif fault_type == faults.TIMEOUT:
+                await asyncio.sleep(action['timeout'])
+                raise asyncio.TimeoutError
+            else:
+                raise faults.FaultConfigError(
+                    f'fault type {fault_type!r} is not supported on send',
+                )
         coro = self._loop.sock_sendall(self._sock, data)
         return await self._with_timeout(coro, timeout=timeout)
 
     async def recv(self, size, *, timeout=_DefaultTimeout):
-        coro = self._loop.sock_recv(self._sock, size)
+        decision = self._fault_evaluate(faults.RECV)
+        effective_size = size
+        if decision is not None and decision.action is not None:
+            action = self._fault_scheduler.resolve_action(decision, size)
+            assert action is not None
+            fault_type = action['type']
+            if fault_type == faults.DELAY:
+                await asyncio.sleep(action['delay'])
+                # Fall through to the normal recv.
+            elif fault_type == faults.HALF_PACKET:
+                effective_size = min(size, action['bytes'])
+                # Fall through to the normal recv with reduced size.
+            elif fault_type == faults.RESET:
+                self._fault_reset()
+                raise faults.FaultConnectionReset(
+                    'Connection reset by fault scheduler',
+                )
+            elif fault_type == faults.TIMEOUT:
+                await asyncio.sleep(action['timeout'])
+                raise asyncio.TimeoutError
+            else:
+                raise faults.FaultConfigError(
+                    f'fault type {fault_type!r} is not supported on recv',
+                )
+        coro = self._loop.sock_recv(self._sock, effective_size)
         return await self._with_timeout(coro, timeout=timeout)
 
     async def recvfrom(self, *args, timeout=_DefaultTimeout):
@@ -118,6 +182,53 @@ class AsyncioSocket:
             timeout = self._default_timeout
 
         return await asyncio.wait_for(awaitable, timeout=timeout)
+
+    def _fault_evaluate(self, direction):
+        scheduler = self._fault_scheduler
+        if scheduler is None:
+            return None
+        key = ('sock', id(self._sock))
+        conn_id = scheduler.on_connection(key)
+        seq = scheduler.next_op_index(key, direction)
+        return scheduler.evaluate(
+            seq=seq,
+            connection=conn_id,
+            direction=direction,
+        )
+
+    async def _send_bytes(self, data) -> int:
+        try:
+            return self._sock.send(data)
+        except (BlockingIOError, InterruptedError):
+            pass
+        fut = self._loop.create_future()
+        try:
+            self._loop.add_writer(
+                self.fileno(),
+                _legacy_io_handler,
+                fut,
+                self._sock.send,
+                data,
+            )
+            return await self._with_timeout(fut, timeout=self._default_timeout)
+        finally:
+            self._loop.remove_writer(self.fileno())
+
+    async def _send_exact(self, data) -> None:
+        sent_total = 0
+        while sent_total < len(data):
+            sent_total += await self._send_bytes(data[sent_total:])
+
+    def _fault_reset(self) -> None:
+        # SO_LINGER with timeout 0 forces RST on close instead of FIN.
+        with contextlib.suppress(OSError):
+            self._sock.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_LINGER,
+                struct.pack('ii', 1, 0),
+            )
+        with contextlib.suppress(OSError):
+            self._sock.close()
 
     async def _sendto_legacy(self, *args, timeout):
         # uvloop and python < 3.11
@@ -193,10 +304,16 @@ def from_socket(
     *,
     loop=None,
     timeout=DEFAULT_TIMEOUT,
+    fault_scheduler: faults.FaultScheduler | None = None,
 ) -> AsyncioSocket:
     if isinstance(sock, AsyncioSocket):
         return sock
-    return AsyncioSocket(sock, loop=loop, timeout=timeout)
+    return AsyncioSocket(
+        sock,
+        loop=loop,
+        timeout=timeout,
+        fault_scheduler=fault_scheduler,
+    )
 
 
 def create_socket(*args, timeout=DEFAULT_TIMEOUT):

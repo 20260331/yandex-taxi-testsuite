@@ -23,7 +23,7 @@ from testsuite.utils import (
 )
 from testsuite.utils import net as net_utils
 
-from . import classes, exceptions, magicargs
+from . import classes, exceptions, faults, magicargs
 from .exceptions import __tracebackhide__  # noqa: F401
 
 DEFAULT_TRACE_ID_HEADER = 'X-YaTraceId'
@@ -262,6 +262,7 @@ class Server:
         self._trace_id_header = trace_id_header
         self._span_id_header = span_id_header
         self._http_proxy_enabled = http_proxy_enabled
+        self._fault_scheduler: faults.FaultScheduler | None = None
 
     @property
     def tracing_enabled(self) -> bool:
@@ -280,6 +281,15 @@ class Server:
     @property
     def http_proxy_enabled(self):
         return self._http_proxy_enabled
+
+    @property
+    def fault_scheduler(self) -> typing.Optional['faults.FaultScheduler']:
+        return self._fault_scheduler
+
+    def set_fault_scheduler(
+        self, scheduler: typing.Optional['faults.FaultScheduler']
+    ) -> None:
+        self._fault_scheduler = scheduler
 
     @property
     def server_info(self) -> classes.MockserverInfo:
@@ -312,13 +322,75 @@ class Server:
 
     async def handle_request(self, request):
         started = time.perf_counter()
+        scheduler = self._fault_scheduler
+        seq = 0
+        conn_id = 0
         try:
-            response = await self._handle_request(request)
+            if scheduler is not None:
+                conn_key = ('http', id(request.transport))
+                conn_id = scheduler.on_connection(conn_key)
+                seq = scheduler.next_request_seq(conn_key)
+                decision = scheduler.evaluate(
+                    seq=seq,
+                    connection=conn_id,
+                    direction=faults.REQUEST,
+                )
+                response = await self._apply_http_fault(
+                    decision, request, response=None
+                )
+                if response is None:
+                    response = await self._handle_request(request)
+                decision = scheduler.evaluate(
+                    seq=seq,
+                    connection=conn_id,
+                    direction=faults.RESPONSE,
+                )
+                response = await self._apply_http_fault(
+                    decision, request, response=response
+                )
+            else:
+                response = await self._handle_request(request)
             self._log_request(started, request, response)
             return response
         except BaseException as exc:
             self._log_request(started, request, exc=exc)
             raise
+
+    async def _apply_http_fault(self, decision, request, *, response):
+        if decision is None or decision.action is None:
+            return response
+        action = decision.action
+        fault_type = action['type']
+        if fault_type == faults.DELAY:
+            await asyncio.sleep(action['delay'])
+            return response
+        if fault_type == faults.TIMEOUT:
+            await asyncio.sleep(action['timeout'])
+            self._abort_transport(request.transport)
+            raise faults.FaultConnectionReset(
+                f'Connection reset after fault timeout of '
+                f'{action["timeout"]:.3f}s',
+            )
+        if fault_type == faults.RESET:
+            self._abort_transport(request.transport)
+            raise faults.FaultConnectionReset(
+                'Connection reset by fault scheduler',
+            )
+        if fault_type == faults.ERROR_RESPONSE:
+            return aiohttp.web.Response(
+                status=action['status'],
+                text=action['body'],
+                headers=action['headers'],
+                content_type=action['content_type'],
+            )
+        raise exceptions.MockServerError(
+            f'fault type {fault_type!r} is not supported at the http '
+            'mockserver layer, use the socket layer instead',
+        )
+
+    def _abort_transport(self, transport):
+        if transport is not None:
+            transport.abort()
 
     def _log_request(self, started, request, response=None, exc=None):
         if exc is None and not self._mockserver_debug:
