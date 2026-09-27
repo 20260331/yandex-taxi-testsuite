@@ -17,6 +17,7 @@ pytest_plugins = [
     'testsuite.plugins.object_hook',
     'testsuite.plugins.servicelogs',
     'testsuite.plugins.servicetest',
+    'testsuite.plugins.task_audit',
     'testsuite.plugins.tcp_mockserver',
     'testsuite.plugins.testpoint',
     'testsuite.plugins.tracing',
