@@ -232,7 +232,10 @@ class CreateServiceClientFixture(typing.Protocol):
 
 @pytest.fixture
 def ensure_daemon_started(
-    _global_daemon_store: _DaemonStore, _testsuite_suspend_capture, pytestconfig
+    _global_daemon_store: _DaemonStore,
+    _testsuite_suspend_capture,
+    _artifact_bundle_store,
+    pytestconfig,
 ) -> EnsureDaemonStartedFixture:
     requests = set()
 
@@ -244,8 +247,15 @@ def ensure_daemon_started(
 
         if pytestconfig.option.service_wait:
             with _testsuite_suspend_capture():
-                return await _global_daemon_store.request(scope)
-        return await _global_daemon_store.request(scope)
+                instance = await _global_daemon_store.request(scope)
+        else:
+            instance = await _global_daemon_store.request(scope)
+        _artifact_bundle_store.bind_process(
+            instance.process,
+            scope_name=scope.name,
+            daemon_instance_id=instance.id,
+        )
+        return instance
 
     return ensure_daemon_started
 
@@ -255,6 +265,7 @@ def service_spawner_factory(
     pytestconfig: Any,
     service_client_session_factory: Any,
     wait_service_started: Any,
+    _artifact_bundle_store,
 ) -> ServiceSpawnerFactory:
     def service_spawner_factory(
         args: Sequence[str],
@@ -287,33 +298,61 @@ def service_spawner_factory(
         )
 
         command_args = _build_command_args(args, base_command)
+        startup_meta = {
+            'command': command_args,
+            'base_command': base_command,
+            'env': env,
+            'options_env': (
+                subprocess_options.get('env') if subprocess_options else None
+            ),
+            'cwd': (
+                subprocess_options.get('cwd') if subprocess_options else None
+            ),
+            'ping_url': ping_url,
+            'shutdown_signal': _signal_name(shutdown_signal),
+        }
 
         @contextlib.asynccontextmanager
         async def spawn():
-            if pytestconfig.option.service_wait:
-                manager = wait_service_started(
-                    args=command_args,
-                    health_check=health_check,
-                )
-            elif pytestconfig.option.service_disable:
-                manager = service_daemon.start_dummy_process()
-            else:
-                manager = service_daemon.start(
-                    args=command_args,
-                    env=env,
-                    shutdown_signal=shutdown_signal,
-                    shutdown_timeout=shutdown_timeout,
-                    poll_retries=poll_retries,
-                    health_check=health_check,
-                    session_factory=service_client_session_factory,
-                    subprocess_options=subprocess_options,
-                    setup_service=setup_service,
-                    subprocess_spawner=subprocess_spawner,
-                    stdout_handler=stdout_handler,
-                    stderr_handler=stderr_handler,
-                )
-            async with manager as process:
-                yield process
+            capture = _artifact_bundle_store.start_capture(startup_meta)
+            (
+                artifact_stdout_handler,
+                artifact_stderr_handler,
+            ) = capture.wrap_handlers(stdout_handler, stderr_handler)
+            try:
+                if pytestconfig.option.service_wait:
+                    startup_meta['mode'] = 'wait'
+                    manager = wait_service_started(
+                        args=command_args,
+                        health_check=health_check,
+                    )
+                elif pytestconfig.option.service_disable:
+                    startup_meta['mode'] = 'disable'
+                    manager = service_daemon.start_dummy_process()
+                else:
+                    startup_meta['mode'] = 'spawn'
+                    manager = service_daemon.start(
+                        args=command_args,
+                        env=env,
+                        shutdown_signal=shutdown_signal,
+                        shutdown_timeout=shutdown_timeout,
+                        poll_retries=poll_retries,
+                        health_check=health_check,
+                        session_factory=service_client_session_factory,
+                        subprocess_options=subprocess_options,
+                        setup_service=setup_service,
+                        subprocess_spawner=subprocess_spawner,
+                        stdout_handler=artifact_stdout_handler,
+                        stderr_handler=artifact_stderr_handler,
+                    )
+                async with manager as process:
+                    capture.attach(process)
+                    yield process
+            except BaseException as exc:
+                capture.fail(exc)
+                raise
+            finally:
+                capture.finish()
 
         return spawn
 
@@ -564,3 +603,10 @@ def _build_command_args(
     base_command: Sequence | None,
 ) -> tuple[str, ...]:
     return tuple(str(arg) for arg in itertools.chain(base_command or (), args))
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return str(signum)

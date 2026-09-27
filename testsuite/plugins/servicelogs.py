@@ -60,6 +60,15 @@ class ServiceLogsPlugin:
         loop = asyncio.get_running_loop()
         self._flushers.append((loop, func))
 
+    def iter_logfiles(self):
+        """Iterate over registered logfiles as ``(path, title)`` pairs."""
+        for (path, title), logfile in self._logs.items():
+            yield path, title
+
+    def flush(self):
+        """Run registered async flushers (best effort)."""
+        self._run_flushers()
+
     def register_logfile(
         self, path: pathlib.Path, title: str, formatter_factory
     ):

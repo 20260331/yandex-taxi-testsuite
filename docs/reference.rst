@@ -22,4 +22,5 @@ pytest plugins:
    utils
    tcp_mockserver
    servicelogs
+   artifact_bundle
    protobuf

@@ -3,6 +3,7 @@ import testsuite
 # Common testsuite plugins
 pytest_plugins = [
     'testsuite.plugins.asyncio',
+    'testsuite.plugins.artifact_bundle',
     'testsuite.daemons.pytest_plugin',
     'testsuite.environment.pytest_plugin',
     'testsuite.mockserver.pytest_plugin',

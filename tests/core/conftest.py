@@ -7,6 +7,7 @@ from testsuite.daemons import service_client
 from testsuite.plugins.assertrepr_compare import CompareVisitor
 
 pytest_plugins = [
+    'pytester',
     'testsuite.pytest_plugin',
 ]
 
